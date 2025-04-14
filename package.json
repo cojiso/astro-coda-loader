@@ -1,0 +1,46 @@
+{
+  "name": "astro-coda-loader",
+  "version": "0.1.1",
+  "description": "Astro loader for Coda.io tables",
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "astro-coda-loader": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "astro-loader",
+    "astro",
+    "coda",
+    "coda.io",
+    "content"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/astro-coda-loader.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/astro-coda-loader/issues"
+  },
+  "homepage": "https://github.com/yourusername/astro-coda-loader#readme",
+  "peerDependencies": {
+    "astro": "^5.0.0 || ^4.14.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "astro": "^5.5.2",
+    "typescript": "^5.8.2"
+  }
+}

@@ -1,0 +1,93 @@
+---
+// Example of an Astro component using data from a Coda collection
+import { getCollection } from "astro:content";
+
+// Get all items from the projects collection
+const projects = await getCollection("projects");
+
+// Or filter items at query time
+const activeProjects = await getCollection("projects", (project) => 
+  project.data.values["c-status-column"] === "Active"
+);
+---
+
+<div class="projects-container">
+  <h1>Projects</h1>
+  
+  <div class="project-grid">
+    {projects.map((project) => (
+      <div class="project-card">
+        <h2>{project.data.name}</h2>
+        
+        {project.data.values["c-description-column"] && (
+          <p class="description">{project.data.values["c-description-column"]}</p>
+        )}
+        
+        <div class="meta">
+          <div class="date">
+            Created: {new Date(project.data.createdAt).toLocaleDateString()}
+          </div>
+          
+          {project.data.values["c-start-date-column"] && (
+            <div class="date">
+              Start: {new Date(project.data.values["c-start-date-column"]).toLocaleDateString()}
+            </div>
+          )}
+          
+          {project.data.values["c-status-column"] && (
+            <div class="status">
+              Status: <span class={`status-${project.data.values["c-status-column"].toLowerCase()}`}>
+                {project.data.values["c-status-column"]}
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    ))}
+  </div>
+</div>
+
+<style>
+  .project-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 2rem;
+  }
+  
+  .project-card {
+    border: 1px solid #eaeaea;
+    border-radius: 8px;
+    padding: 1.5rem;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  
+  .project-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+  }
+  
+  .description {
+    color: #666;
+    margin: 1rem 0;
+  }
+  
+  .meta {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 1rem;
+    font-size: 0.9rem;
+  }
+  
+  .status-active {
+    color: green;
+    font-weight: bold;
+  }
+  
+  .status-planning {
+    color: blue;
+  }
+  
+  .status-completed {
+    color: gray;
+  }
+</style>
