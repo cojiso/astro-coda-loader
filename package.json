@@ -16,7 +16,9 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
+    
   },
   "keywords": [
     "astro-loader",
