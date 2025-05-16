@@ -8,7 +8,6 @@ yarn-error.log
 dist/
 *.js
 *.js.map
-*.d.ts
 !jest.config.js
 
 # Exceptions
