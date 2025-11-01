@@ -5,7 +5,7 @@ This package provides a Coda.io loader for Astro. It allows you to load data fro
 ## Installation
 
 ```sh
-npm install astro-coda-loader
+pnpm install astro-coda-loader
 ```
 
 ## Prerequisites
@@ -99,8 +99,8 @@ The `codaLoader` function accepts the following options:
 | `token` | `string` | Your Coda API token | Value of `CODA_API_TOKEN` or `PUBLIC_CODA_API_TOKEN` environment variable |
 | `docId` | `string` | The ID of your Coda document | Value of `CODA_DOC_ID` or `PUBLIC_CODA_DOC_ID` environment variable |
 | `tableIdOrName` | `string` | The name or ID of the table to load from | Value of `CODA_TABLE_ID` or `PUBLIC_CODA_TABLE_ID` environment variable |
-| `filter` | `string` | A formula to filter rows (optional) | - |
-| `sortBy` | `object` | Sorting options with column and direction (optional) | - |
+| `query` | `string` or `QueryFilter` | Query to filter rows. String format: `<column_id_or_name>:<value>`. Object format for OR conditions: `{ column: string, values: array }` (optional) | - |
+| `sortBy` | `string` | Sort order: `"createdAt"`, `"natural"`, or `"updatedAt"` (optional) | - |
 | `limit` | `number` | Maximum number of rows to fetch (optional) | - |
 | `cleanStrings` | `boolean` | Whether to remove backticks from string values | `true` |
 
@@ -112,16 +112,36 @@ const tasks = defineCollection({
     token: "your-api-token", // It's better to use environment variables instead
     docId: "YOUR_CODA_DOC_ID",
     tableIdOrName: "Tasks",
-    filter: "Status = 'Active'",
-    sortBy: {
-      column: "DueDate",
-      direction: "asc"
-    },
+    query: 'c-status:"Active"', // or use column name: "Status":"Active"
+    sortBy: "updatedAt",
     limit: 100,
     cleanStrings: true
   }),
 });
 ```
+
+### Multiple Values Query (OR Conditions)
+
+You can filter by multiple values on a single column using the object format. This is useful for OR conditions:
+
+```typescript
+const tasks = defineCollection({
+  loader: codaLoader({
+    docId: "YOUR_CODA_DOC_ID",
+    tableIdOrName: "Tasks",
+    // Fetch tasks that are either "Active" OR "In Progress" OR "Blocked"
+    query: {
+      column: "c-status", // or use column name: "Status"
+      values: ["Active", "In Progress", "Blocked"]
+    },
+  }),
+});
+```
+
+This is equivalent to making multiple API calls with individual queries and combining the results. The loader automatically:
+- Makes separate API calls for each value
+- Removes duplicate rows (by ID)
+- Handles proper escaping and quoting of values
 
 ## Working with Coda's Rich Data Types
 

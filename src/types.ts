@@ -1,4 +1,15 @@
 // astro-coda-loader/src/types.ts
+
+/**
+ * Query filter for OR conditions on a single column
+ */
+export interface QueryFilter {
+  /** Column ID or name to filter on */
+  column: string;
+  /** Array of values to match (OR condition) */
+  values: (string | number | boolean)[];
+}
+
 export interface CodaLoaderOptions {
   /** The Coda API token. Defaults to CODA_API_TOKEN env var or PUBLIC_CODA_API_TOKEN */
   token?: string;
@@ -6,18 +17,19 @@ export interface CodaLoaderOptions {
   docId?: string;
   /** The table ID or name. Defaults to CODA_TABLE_ID env var or PUBLIC_CODA_TABLE_ID */
   tableIdOrName?: string;
-  /** Optional filter formula to apply */
-  filter?: string;
-  /** Optional sort column and direction */
-  sortBy?: {
-    column: string;
-    direction?: "asc" | "desc";
-  };
+  /**
+   * Optional query to filter rows.
+   * - String: Single filter query like 'c-status:"Active"'
+   * - Object: OR conditions for a single column like { column: 'c-status', values: ['Active', 'In Progress'] }
+   */
+  query?: string | QueryFilter;
+  /** Optional sort order: "createdAt", "natural", or "updatedAt" */
+  sortBy?: "createdAt" | "natural" | "updatedAt";
   /** Maximum number of rows to fetch */
   limit?: number;
   /** Whether to clean string values (remove backticks). Default: true */
   cleanStrings?: boolean;
-  /** 
+  /**
    * ルックアップを展開する最大深度。
    * 0: 展開しない (デフォルト)
    * 1以上: 指定された深さまで展開する

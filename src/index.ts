@@ -12,8 +12,9 @@ export {
   cleanString,
   cleanValues
 } from './normalize-utils';
-export type { 
+export type {
   CodaLoaderOptions,
+  QueryFilter,
   CodaRow,
   RawValue,
   CodaImage,

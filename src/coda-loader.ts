@@ -2,8 +2,9 @@
 import type { Loader, LoaderContext } from "astro/loaders";
 import { AstroError } from "astro/errors";
 import { z } from "astro/zod";
-import { 
-  type CodaLoaderOptions, 
+import {
+  type CodaLoaderOptions,
+  type QueryFilter,
   type CodaResponse,
   type CodaColumnsResponse,
   type CodaRow,
@@ -486,7 +487,7 @@ export function codaLoader({
   token = import.meta.env.CODA_API_TOKEN || import.meta.env.PUBLIC_CODA_API_TOKEN,
   docId = import.meta.env.CODA_DOC_ID || import.meta.env.PUBLIC_CODA_DOC_ID,
   tableIdOrName = import.meta.env.CODA_TABLE_ID || import.meta.env.PUBLIC_CODA_TABLE_ID,
-  filter,
+  query,
   sortBy,
   limit,
   cleanStrings = true,
@@ -537,23 +538,21 @@ export function codaLoader({
       
       // Construct the API URL
       const baseUrl = `https://coda.io/apis/v1/docs/${docId}/tables/${encodeURIComponent(tableIdOrName)}/rows`;
-      
-      // Add query parameters
-      const queryParams = new URLSearchParams();
-      
-      // Always add valueFormat=rich to get enhanced data including images
-      queryParams.append("valueFormat", "rich");
-      
-      if (filter) queryParams.append("filter", filter);
-      if (sortBy) {
-        queryParams.append("sortBy", sortBy.column);
-        if (sortBy.direction) queryParams.append("direction", sortBy.direction);
-      }
-      if (limit) queryParams.append("limit", limit.toString());
-      
-      const url = `${baseUrl}?${queryParams.toString()}`;
-      
-      try {
+
+      // Helper function to fetch and process rows for a single query
+      const fetchAndProcessRows = async (queryString?: string) => {
+        // Add query parameters
+        const queryParams = new URLSearchParams();
+
+        // Always add valueFormat=rich to get enhanced data including images
+        queryParams.append("valueFormat", "rich");
+
+        if (queryString) queryParams.append("query", queryString);
+        if (sortBy) queryParams.append("sortBy", sortBy);
+        if (limit) queryParams.append("limit", limit.toString());
+
+        const url = `${baseUrl}?${queryParams.toString()}`;
+
         // Fetch data from Coda.io API
         const response = await fetch(url, {
           headers: {
@@ -561,7 +560,7 @@ export function codaLoader({
             "Content-Type": "application/json",
           },
         });
-        
+
         if (!response.ok) {
           const errorData = await response.json();
           throw new AstroError(
@@ -570,10 +569,10 @@ export function codaLoader({
         }
 
         const data = await response.json() as CodaResponse;
-        
+
         // ルックアップの展開を行う（maxLookupDepth > 0 の場合のみ）
         let processedRows: CodaRow[];
-        
+
         if (maxLookupDepth > 0) {
           try {
             processedRows = await expandLookups(data.items, docId, token, maxLookupDepth, logger);
@@ -584,41 +583,74 @@ export function codaLoader({
         } else {
           processedRows = data.items;
         }
-        
-        // Process rows and add to store
-        for (const row of processedRows) {
-          const id = row.id;
-          
-          // 空の値を対応するオブジェクトに変換
-          const normalizedValues = normalizeEmptyToObject(row.values, columnTypesCache);
-          
-          // 文字列のクリーニング（バッククォート除去など）
-          const cleanedValues = cleanStrings ? cleanValues(normalizedValues) : normalizedValues;
-          
-          // 処理済みの行データを作成
-          let rowData: CodaRow = {
-            ...row,
-            values: cleanedValues
-          };
-          
-          // Convert to Record<string, unknown> for parseData compatibility
-          const dataForParsing: Record<string, unknown> = {
-            id: rowData.id,
-            type: rowData.type,
-            name: rowData.name,
-            index: rowData.index,
-            createdAt: rowData.createdAt,
-            updatedAt: rowData.updatedAt,
-            browserLink: rowData.browserLink,
-            href: rowData.href,
-            values: rowData.values
-          };
-          
-          const parsedData = await parseData({ id, data: dataForParsing });
-          store.set({ id, data: parsedData });
+
+        return processedRows;
+      };
+
+      try {
+        // Convert query to array of query strings
+        let queries: (string | undefined)[];
+
+        if (!query) {
+          // No query specified
+          queries = [undefined];
+        } else if (typeof query === 'string') {
+          // Single string query
+          queries = [query];
+        } else {
+          // QueryFilter object - convert to multiple query strings
+          const { column, values } = query;
+
+          // Handle column names with spaces (need quotes)
+          const columnPart = column.includes(' ') ? `"${column}"` : column;
+
+          queries = values.map(value => {
+            // JSON.stringify handles strings, numbers, booleans correctly
+            return `${columnPart}:${JSON.stringify(value)}`;
+          });
         }
-        
-        logger.info(`Loaded ${processedRows.length} records from "${tableIdOrName}"`);
+
+        let totalRowsProcessed = 0;
+
+        for (const q of queries) {
+          const processedRows = await fetchAndProcessRows(q);
+
+          // Process rows and add to store
+          for (const row of processedRows) {
+            const id = row.id;
+
+            // 空の値を対応するオブジェクトに変換
+            const normalizedValues = normalizeEmptyToObject(row.values, columnTypesCache);
+
+            // 文字列のクリーニング（バッククォート除去など）
+            const cleanedValues = cleanStrings ? cleanValues(normalizedValues) : normalizedValues;
+
+            // 処理済みの行データを作成
+            let rowData: CodaRow = {
+              ...row,
+              values: cleanedValues
+            };
+
+            // Convert to Record<string, unknown> for parseData compatibility
+            const dataForParsing: Record<string, unknown> = {
+              id: rowData.id,
+              type: rowData.type,
+              name: rowData.name,
+              index: rowData.index,
+              createdAt: rowData.createdAt,
+              updatedAt: rowData.updatedAt,
+              browserLink: rowData.browserLink,
+              href: rowData.href,
+              values: rowData.values
+            };
+
+            const parsedData = await parseData({ id, data: dataForParsing });
+            store.set({ id, data: parsedData });
+            totalRowsProcessed++;
+          }
+        }
+
+        logger.info(`Loaded ${totalRowsProcessed} records from "${tableIdOrName}" (${queries.length} ${queries.length === 1 ? 'query' : 'queries'})`);
       } catch (error: unknown) {
         if (error instanceof AstroError) {
           throw error;
