@@ -391,6 +391,24 @@ PUBLIC_CODA_TABLE_ID=your-table-id
 
 > **Note**: Be careful with using PUBLIC_* variables for API tokens, as they will be exposed to the client-side code.
 
+## Debug Logging
+
+The loader uses Astro's built-in logger for output. To see detailed debug logs (such as lookup expansion progress and API request details), set the log level to `debug` in your Astro config:
+
+```javascript
+// astro.config.mjs
+export default defineConfig({
+  vite: {
+    logLevel: 'info', // or 'debug' for more verbose output
+  },
+});
+```
+
+When debug logging is enabled, you'll see additional information about:
+- Lookup reference expansion progress
+- Individual API requests for referenced rows
+- Sample expanded row structures
+
 ## Example Component
 
 Here's an example Astro component that displays a gallery of images from Coda:

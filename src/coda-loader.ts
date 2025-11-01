@@ -43,7 +43,8 @@ async function expandSingleReference(
   token: string,
   context: ProcessingContext,
   currentDepth: number,
-  maxDepth: number
+  maxDepth: number,
+  logger: any
 ): Promise<CodaRowReference | null> {
   const refKey = `${reference.tableId}:${reference.rowId}`;
   
@@ -58,6 +59,7 @@ async function expandSingleReference(
     try {
       // 参照先のデータを取得
       context.requestCount++;
+      logger.debug(`Fetching referenced row: ${refKey} (Request #${context.requestCount})`);
       referencedRow = await fetchRowData(docId, reference.tableId, reference.rowId, token);
       context.cache[refKey] = referencedRow;
     } catch (error) {
@@ -82,7 +84,8 @@ async function expandSingleReference(
     token,
     context,
     currentDepth + 1,
-    maxDepth
+    maxDepth,
+    logger
   );
 
   // 元の参照に展開データを追加
@@ -94,8 +97,9 @@ async function expandSingleReference(
     }
   };
 
-  console.log(`Expanded ref: ${reference.rowId}, values keys: ${Object.keys(deeperExpandedRow.values).length}`);
-  
+  // Debug logging
+  logger.debug(`Expanded ref: ${reference.rowId} at depth ${currentDepth}`);
+
   return expandedRef;
 }
 
@@ -108,7 +112,8 @@ async function expandRowLookups(
   token: string,
   context: ProcessingContext,
   currentDepth: number = 0,
-  maxDepth: number = 1
+  maxDepth: number = 1,
+  logger: any
 ): Promise<CodaRow> {
   // 展開しない条件
   if (maxDepth <= 0 || currentDepth >= maxDepth) {
@@ -129,7 +134,8 @@ async function expandRowLookups(
         token,
         context,
         currentDepth,
-        maxDepth
+        maxDepth,
+        logger
       );
       
       // 展開できた場合のみ値を更新
@@ -156,7 +162,8 @@ async function expandRowLookups(
           token,
           context,
           currentDepth,
-          maxDepth
+          maxDepth,
+          logger
         );
         
         // 展開できなかった場合は元の参照を保持
@@ -230,13 +237,13 @@ async function expandLookups(
   docId: string,
   token: string,
   maxDepth: number,
-  logger: any = null
+  logger: any
 ): Promise<CodaRow[]> {
   if (maxDepth <= 0) {
     return rows; // 展開しない
   }
 
-  if (logger) logger.info(`Expanding lookups to depth ${maxDepth} for ${rows.length} rows...`);
+  logger.info(`Expanding lookups to depth ${maxDepth} for ${rows.length} rows...`);
   
   const context: ProcessingContext = {
     processedRefs: new Set<string>(),
@@ -259,7 +266,7 @@ async function expandLookups(
     
     try {
       // ルックアップを展開
-      const expandedRow = await expandRowLookups(row, docId, token, context, 0, maxDepth);
+      const expandedRow = await expandRowLookups(row, docId, token, context, 0, maxDepth, logger);
 
       // if (logger) {
       //   logger.info(`Expanded row ${row.id} structure: ${JSON.stringify(expandedRow, null, 2)}`);
@@ -277,26 +284,22 @@ async function expandLookups(
     if (now - lastProgressLog > progressInterval || completedRows === totalRows) {
       const elapsedSeconds = Math.round((now - startTime) / 1000);
       const progressPercent = Math.round((completedRows / totalRows) * 100);
-      
-      if (logger) {
-        logger.info(
-          `Lookup expansion progress: ${completedRows}/${totalRows} rows (${progressPercent}%) - ` +
-          `${elapsedSeconds}s elapsed - ` +
-          `API Requests: ${context.requestCount}`
-        );
-      }
+
+      logger.info(
+        `Lookup expansion progress: ${completedRows}/${totalRows} rows (${progressPercent}%) - ` +
+        `${elapsedSeconds}s elapsed - ` +
+        `API Requests: ${context.requestCount}`
+      );
       lastProgressLog = now;
     }
   }
 
   const totalTime = Math.round((Date.now() - startTime) / 1000);
-  if (logger) {
-    logger.info(`Lookup expansion completed in ${totalTime}s - Total API Requests: ${context.requestCount}`);
+  logger.info(`Lookup expansion completed in ${totalTime}s - Total API Requests: ${context.requestCount}`);
 
-    // ここに新しいログを追加
-    if (expandedRows.length > 0) {
-      logger.info(`Sample expanded row structure: ${JSON.stringify(expandedRows[0], null, 2)}`);
-    }
+  // Debug: サンプル行構造を出力
+  if (expandedRows.length > 0) {
+    logger.debug(`Sample expanded row structure: ${JSON.stringify(expandedRows[0], null, 2)}`);
   }
 
   return expandedRows;
