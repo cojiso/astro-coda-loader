@@ -20,9 +20,14 @@ import { cleanValues, isRawRowReference } from "./normalize-utils";
  */
 let columnsCache: Record<string, CodaColumn> = {};
 
-// ルックアップレファレンスキャッシュ
+// ルックアップレファレンスキャッシュ（行単位）
 interface LookupCache {
   [key: string]: CodaRow | null; // tableId:rowId -> 行データ
+}
+
+// テーブル全体のキャッシュ（テーブル単位）
+interface TableCache {
+  [tableId: string]: Map<string, CodaRow>; // tableId -> (rowId -> 行データ)
 }
 
 /**
@@ -31,11 +36,12 @@ interface LookupCache {
 interface ProcessingContext {
   processedRefs: Set<string>;
   cache: LookupCache;
+  tableCache: TableCache;
   requestCount: number;
 }
 
 /**
- * 単一の参照の展開を行う
+ * 単一の参照の展開を行う（テーブルキャッシュ対応版）
  */
 async function expandSingleReference(
   reference: CodaRowReference,
@@ -47,23 +53,49 @@ async function expandSingleReference(
   logger: any
 ): Promise<CodaRowReference | null> {
   const refKey = `${reference.tableId}:${reference.rowId}`;
-  
+
   // 循環参照チェック
   if (context.processedRefs.has(refKey)) {
     return null; // 循環参照は拡張せず、nullを返す
   }
 
-  // 参照をキャッシュから取得、なければ取得して追加
-  let referencedRow = context.cache[refKey];
-  if (referencedRow === undefined) {
+  let referencedRow: CodaRow | null = null;
+
+  // 1. まずテーブルキャッシュから取得を試みる
+  if (context.tableCache[reference.tableId]) {
+    referencedRow = context.tableCache[reference.tableId].get(reference.rowId) || null;
+    if (referencedRow) {
+      logger.debug(`Found row ${refKey} in table cache`);
+    }
+  }
+
+  // 2. テーブルキャッシュになければ、行キャッシュを確認
+  if (!referencedRow && context.cache[refKey] !== undefined) {
+    referencedRow = context.cache[refKey];
+  }
+
+  // 3. どちらのキャッシュにもない場合、テーブル全体を取得してキャッシュ
+  if (!referencedRow && context.cache[refKey] === undefined) {
     try {
-      // 参照先のデータを取得
-      context.requestCount++;
-      logger.debug(`Fetching referenced row: ${refKey} (Request #${context.requestCount})`);
-      referencedRow = await fetchRowData(docId, reference.tableId, reference.rowId, token);
+      // テーブル全体を取得
+      if (!context.tableCache[reference.tableId]) {
+        context.requestCount++;
+        context.tableCache[reference.tableId] = await fetchTableData(
+          docId,
+          reference.tableId,
+          token,
+          logger
+        );
+      }
+
+      // テーブルキャッシュから該当行を取得
+      referencedRow = context.tableCache[reference.tableId].get(reference.rowId) || null;
+
+      // 行キャッシュにも保存（後方互換性のため）
       context.cache[refKey] = referencedRow;
     } catch (error) {
       // 取得に失敗した場合はnullをキャッシュ
+      logger.warn(`Failed to fetch table ${reference.tableId}: ${error instanceof Error ? error.message : String(error)}`);
       context.cache[refKey] = null;
       return null;
     }
@@ -71,6 +103,7 @@ async function expandSingleReference(
 
   // 参照先が見つからなかった場合
   if (referencedRow === null) {
+    logger.debug(`Row ${refKey} not found`);
     return null;
   }
 
@@ -191,7 +224,7 @@ async function expandRowLookups(
 }
 
 /**
- * 特定の行データを取得する
+ * 特定の行データを取得する（旧方式：後方互換性のために残す）
  */
 async function fetchRowData(
   docId: string,
@@ -200,11 +233,11 @@ async function fetchRowData(
   token: string
 ): Promise<CodaRow> {
   const url = `https://coda.io/apis/v1/docs/${docId}/tables/${encodeURIComponent(tableId)}/rows/${rowId}?valueFormat=rich`;
-  
+
   // タイムアウト用のコントローラーを作成
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000); // 15秒タイムアウト
-  
+
   try {
     const response = await fetch(url, {
       headers: {
@@ -213,7 +246,7 @@ async function fetchRowData(
       },
       signal: controller.signal
     });
-    
+
     clearTimeout(timeoutId);
 
     if (!response.ok) {
@@ -230,7 +263,77 @@ async function fetchRowData(
 }
 
 /**
- * 複数の行に対してルックアップを展開する
+ * テーブル全体のデータを取得する（新方式：一括取得）
+ */
+async function fetchTableData(
+  docId: string,
+  tableId: string,
+  token: string,
+  logger: any
+): Promise<Map<string, CodaRow>> {
+  const baseUrl = `https://coda.io/apis/v1/docs/${docId}/tables/${encodeURIComponent(tableId)}/rows`;
+  const queryParams = new URLSearchParams();
+  queryParams.append("valueFormat", "rich");
+  queryParams.append("limit", "500"); // 1リクエストあたりの最大取得数
+
+  const rowsMap = new Map<string, CodaRow>();
+  let pageToken: string | undefined = undefined;
+  let pageCount = 0;
+
+  do {
+    if (pageToken) {
+      queryParams.set("pageToken", pageToken);
+    }
+
+    const url = `${baseUrl}?${queryParams.toString()}`;
+
+    // タイムアウト用のコントローラーを作成
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30秒タイムアウト
+
+    try {
+      pageCount++;
+      logger.debug(`Fetching table ${tableId} page ${pageCount}...`);
+
+      const response = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`Failed to fetch table data: ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json() as CodaResponse;
+
+      // 行データをMapに格納
+      for (const row of data.items) {
+        rowsMap.set(row.id, row);
+      }
+
+      pageToken = data.nextPageToken;
+
+      logger.debug(`Fetched ${data.items.length} rows from table ${tableId} (total: ${rowsMap.size})`);
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`Request timed out while fetching table ${tableId}`);
+      }
+      throw error;
+    }
+  } while (pageToken);
+
+  logger.info(`Loaded table ${tableId}: ${rowsMap.size} rows`);
+  return rowsMap;
+}
+
+/**
+ * 複数の行に対してルックアップを展開する（テーブルキャッシュ対応版）
  */
 async function expandLookups(
   rows: CodaRow[],
@@ -244,16 +347,17 @@ async function expandLookups(
   }
 
   logger.info(`Expanding lookups to depth ${maxDepth} for ${rows.length} rows...`);
-  
+
   const context: ProcessingContext = {
     processedRefs: new Set<string>(),
     cache: {},
+    tableCache: {}, // テーブルキャッシュを初期化
     requestCount: 0
   };
 
   const expandedRows: CodaRow[] = [];
   const startTime = Date.now();
-  
+
   // 進捗状況表示のための変数
   const totalRows = rows.length;
   let completedRows = 0;
@@ -263,7 +367,7 @@ async function expandLookups(
   for (const row of rows) {
     // 各行に対する処理済み参照をリセット（行をまたぐ循環参照は許可）
     context.processedRefs.clear();
-    
+
     try {
       // ルックアップを展開
       const expandedRow = await expandRowLookups(row, docId, token, context, 0, maxDepth, logger);
@@ -275,9 +379,10 @@ async function expandLookups(
       expandedRows.push(expandedRow);
     } catch (error) {
       // エラーの場合は元の行を追加して処理を続行
+      logger.warn(`Error expanding row ${row.id}: ${error instanceof Error ? error.message : String(error)}`);
       expandedRows.push(row);
     }
-    
+
     // 進捗状況の更新とログ
     completedRows++;
     const now = Date.now();
@@ -285,17 +390,35 @@ async function expandLookups(
       const elapsedSeconds = Math.round((now - startTime) / 1000);
       const progressPercent = Math.round((completedRows / totalRows) * 100);
 
+      // テーブルキャッシュの統計情報
+      const cachedTableCount = Object.keys(context.tableCache).length;
+      const cachedRowCount = Object.values(context.tableCache).reduce(
+        (sum, table) => sum + table.size,
+        0
+      );
+
       logger.info(
         `Lookup expansion progress: ${completedRows}/${totalRows} rows (${progressPercent}%) - ` +
         `${elapsedSeconds}s elapsed - ` +
-        `API Requests: ${context.requestCount}`
+        `API Requests: ${context.requestCount} - ` +
+        `Cached: ${cachedTableCount} tables (${cachedRowCount} rows)`
       );
       lastProgressLog = now;
     }
   }
 
   const totalTime = Math.round((Date.now() - startTime) / 1000);
-  logger.info(`Lookup expansion completed in ${totalTime}s - Total API Requests: ${context.requestCount}`);
+  const cachedTableCount = Object.keys(context.tableCache).length;
+  const cachedRowCount = Object.values(context.tableCache).reduce(
+    (sum, table) => sum + table.size,
+    0
+  );
+
+  logger.info(
+    `Lookup expansion completed in ${totalTime}s - ` +
+    `Total API Requests: ${context.requestCount} - ` +
+    `Cached ${cachedTableCount} tables (${cachedRowCount} total rows)`
+  );
 
   // Debug: サンプル行構造を出力
   if (expandedRows.length > 0) {
