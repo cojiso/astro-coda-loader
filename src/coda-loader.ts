@@ -697,8 +697,8 @@ export function codaLoader({
       // Construct the API URL
       const baseUrl = `https://coda.io/apis/v1/docs/${docId}/tables/${encodeURIComponent(tableIdOrName)}/rows`;
 
-      // Helper function to fetch and process rows for a single query
-      const fetchAndProcessRows = async (queryString?: string) => {
+      // Helper function to fetch rows for a single query (without lookup expansion)
+      const fetchRowsForQuery = async (queryString?: string): Promise<CodaRow[]> => {
         // Add query parameters
         const queryParams = new URLSearchParams();
 
@@ -727,22 +727,7 @@ export function codaLoader({
         }
 
         const data = await response.json() as CodaResponse;
-
-        // ルックアップの展開を行う（maxLookupDepth > 0 の場合のみ）
-        let processedRows: CodaRow[];
-
-        if (maxLookupDepth > 0) {
-          try {
-            processedRows = await expandLookups(data.items, docId, token, maxLookupDepth, logger);
-          } catch (error) {
-            logger.warn(`Error during lookup expansion, continuing with unexpanded data`);
-            processedRows = data.items;
-          }
-        } else {
-          processedRows = data.items;
-        }
-
-        return processedRows;
+        return data.items;
       };
 
       try {
@@ -768,47 +753,71 @@ export function codaLoader({
           });
         }
 
-        let totalRowsProcessed = 0;
-
+        // Step 1: Fetch rows for all queries
+        let allRows: CodaRow[] = [];
         for (const q of queries) {
-          const processedRows = await fetchAndProcessRows(q);
-
-          // Process rows and add to store
-          for (const row of processedRows) {
-            const id = row.id;
-
-            // 空の値を対応するオブジェクトに変換
-            const normalizedValues = normalizeEmptyToObject(row.values, columnTypesCache);
-
-            // 文字列のクリーニング（バッククォート除去など）
-            const cleanedValues = cleanStrings ? cleanValues(normalizedValues) : normalizedValues;
-
-            // 処理済みの行データを作成
-            let rowData: CodaRow = {
-              ...row,
-              values: cleanedValues
-            };
-
-            // Convert to Record<string, unknown> for parseData compatibility
-            const dataForParsing: Record<string, unknown> = {
-              id: rowData.id,
-              type: rowData.type,
-              name: rowData.name,
-              index: rowData.index,
-              createdAt: rowData.createdAt,
-              updatedAt: rowData.updatedAt,
-              browserLink: rowData.browserLink,
-              href: rowData.href,
-              values: rowData.values
-            };
-
-            const parsedData = await parseData({ id, data: dataForParsing });
-            store.set({ id, data: parsedData });
-            totalRowsProcessed++;
-          }
+          const rows = await fetchRowsForQuery(q);
+          allRows.push(...rows);
         }
 
-        logger.info(`Loaded ${totalRowsProcessed} records from "${tableIdOrName}" (${queries.length} ${queries.length === 1 ? 'query' : 'queries'})`);
+        // Remove duplicates by ID (in case queries overlap)
+        const uniqueRowsMap = new Map<string, CodaRow>();
+        for (const row of allRows) {
+          uniqueRowsMap.set(row.id, row);
+        }
+        const uniqueRows = Array.from(uniqueRowsMap.values());
+
+        logger.info(`Fetched ${uniqueRows.length} unique rows from ${queries.length} ${queries.length === 1 ? 'query' : 'queries'}`);
+
+        // Step 2: Expand lookups once for all rows (if maxLookupDepth > 0)
+        let processedRows: CodaRow[];
+        if (maxLookupDepth > 0) {
+          try {
+            processedRows = await expandLookups(uniqueRows, docId, token, maxLookupDepth, logger);
+          } catch (error) {
+            logger.warn(`Error during lookup expansion, continuing with unexpanded data`);
+            processedRows = uniqueRows;
+          }
+        } else {
+          processedRows = uniqueRows;
+        }
+
+        // Step 3: Process rows and add to store
+        let totalRowsProcessed = 0;
+        for (const row of processedRows) {
+          const id = row.id;
+
+          // 空の値を対応するオブジェクトに変換
+          const normalizedValues = normalizeEmptyToObject(row.values, columnTypesCache);
+
+          // 文字列のクリーニング（バッククォート除去など）
+          const cleanedValues = cleanStrings ? cleanValues(normalizedValues) : normalizedValues;
+
+          // 処理済みの行データを作成
+          let rowData: CodaRow = {
+            ...row,
+            values: cleanedValues
+          };
+
+          // Convert to Record<string, unknown> for parseData compatibility
+          const dataForParsing: Record<string, unknown> = {
+            id: rowData.id,
+            type: rowData.type,
+            name: rowData.name,
+            index: rowData.index,
+            createdAt: rowData.createdAt,
+            updatedAt: rowData.updatedAt,
+            browserLink: rowData.browserLink,
+            href: rowData.href,
+            values: rowData.values
+          };
+
+          const parsedData = await parseData({ id, data: dataForParsing });
+          store.set({ id, data: parsedData });
+          totalRowsProcessed++;
+        }
+
+        logger.info(`Loaded ${totalRowsProcessed} records from "${tableIdOrName}"`);
       } catch (error: unknown) {
         if (error instanceof AstroError) {
           throw error;
