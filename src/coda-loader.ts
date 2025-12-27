@@ -43,7 +43,6 @@ interface ProcessingContext {
   processedRefs: Set<string>;
   cache: LookupCache;
   tableCache: TableCache;
-  requestCount: number;
 }
 
 /**
@@ -87,7 +86,6 @@ async function expandSingleReference(
     try {
       // テーブル全体を取得
       if (!context.tableCache[reference.tableId]) {
-        context.requestCount++;
         context.tableCache[reference.tableId] = await fetchTableData(
           docId,
           reference.tableId,
@@ -356,7 +354,7 @@ async function fetchTableData(
     }
   } while (pageToken);
 
-  logger.info(`Loaded table ${tableId}: ${rowsMap.size} rows`);
+  logger.info(`Loaded table ${tableId} - ${rowsMap.size} rows`);
 
   return {
     rows: rowsMap,
@@ -383,18 +381,11 @@ async function expandLookups(
   const context: ProcessingContext = {
     processedRefs: new Set<string>(),
     cache: {},
-    tableCache: {}, // テーブルキャッシュを初期化
-    requestCount: 0
+    tableCache: {} // テーブルキャッシュを初期化
   };
 
   const expandedRows: CodaRow[] = [];
   const startTime = Date.now();
-
-  // 進捗状況表示のための変数
-  const totalRows = rows.length;
-  let completedRows = 0;
-  let lastProgressLog = Date.now();
-  const progressInterval = 5000; // 進捗を表示する間隔（ミリ秒）
 
   for (const row of rows) {
     // 各行に対する処理済み参照をリセット（行をまたぐ循環参照は許可）
@@ -414,42 +405,14 @@ async function expandLookups(
       logger.warn(`Error expanding row ${row.id}: ${error instanceof Error ? error.message : String(error)}`);
       expandedRows.push(row);
     }
-
-    // 進捗状況の更新とログ
-    completedRows++;
-    const now = Date.now();
-    if (now - lastProgressLog > progressInterval || completedRows === totalRows) {
-      const elapsedSeconds = Math.round((now - startTime) / 1000);
-      const progressPercent = Math.round((completedRows / totalRows) * 100);
-
-      // テーブルキャッシュの統計情報
-      const cachedTableCount = Object.keys(context.tableCache).length;
-      const cachedRowCount = Object.values(context.tableCache).reduce(
-        (sum, table) => sum + table.rows.size,
-        0
-      );
-
-      logger.info(
-        `Lookup expansion progress: ${completedRows}/${totalRows} rows (${progressPercent}%) - ` +
-        `${elapsedSeconds}s elapsed - ` +
-        `API Requests: ${context.requestCount} - ` +
-        `Cached: ${cachedTableCount} tables (${cachedRowCount} rows)`
-      );
-      lastProgressLog = now;
-    }
   }
 
   const totalTime = Math.round((Date.now() - startTime) / 1000);
   const cachedTableCount = Object.keys(context.tableCache).length;
-  const cachedRowCount = Object.values(context.tableCache).reduce(
-    (sum, table) => sum + table.rows.size,
-    0
-  );
 
   logger.info(
     `Lookup expansion completed in ${totalTime}s - ` +
-    `Total API Requests: ${context.requestCount} - ` +
-    `Cached ${cachedTableCount} tables (${cachedRowCount} total rows)`
+    `Cached ${cachedTableCount} tables`
   );
 
   // Debug: サンプル行構造を出力
@@ -767,7 +730,14 @@ export function codaLoader({
         }
         const uniqueRows = Array.from(uniqueRowsMap.values());
 
-        logger.info(`Fetched ${uniqueRows.length} unique rows from ${queries.length} ${queries.length === 1 ? 'query' : 'queries'}`);
+        // Build log message with query details
+        let logMessage = `Fetched ${uniqueRows.length} unique rows from ${queries.length} ${queries.length === 1 ? 'query' : 'queries'}`;
+        // Show values from the original query object
+        if (query && typeof query === 'object' && 'column' in query) {
+          const valuesStr = query.values.map(v => JSON.stringify(v)).join(', ');
+          logMessage += ` [${valuesStr}]`;
+        }
+        logger.info(logMessage);
 
         // Step 2: Expand lookups once for all rows (if maxLookupDepth > 0)
         let processedRows: CodaRow[];
