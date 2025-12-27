@@ -76,12 +76,9 @@ export function codaFormatToZodType(
       break;
       
     case "boolean":
-    case "checkbox":  
+    case "checkbox":
       // 真偽値または null
-      zodType = z.union([
-        z.boolean(),
-        z.null()
-      ]);
+      zodType = z.boolean().nullable();
       break;
       
     case "text":
@@ -97,8 +94,21 @@ export function codaFormatToZodType(
       break;
       
     case "select":
-      // 選択肢は文字列
-      zodType = z.string();
+      // 選択肢は文字列、options があれば enum で定義
+      if (format.options && format.options.length > 0) {
+        const optionNames = format.options.map(opt => opt.name);
+        // z.enum requires at least one option
+        zodType = z.enum(optionNames as [string, ...string[]]);
+      } else {
+        // options がない場合は通常の文字列
+        zodType = z.string();
+      }
+
+      // isArray: true の場合は配列化（空配列も自動的に許可される）
+      // 空文字列は normalizeEmptyToObject で空配列に正規化される
+      if (format.isArray) {
+        zodType = z.array(zodType);
+      }
       break;
       
     case "image":
@@ -130,13 +140,14 @@ export function codaFormatToZodType(
       zodType = z.any();
   }
   
-  // Handle arrays - image と lookup はすでに処理済み
-  if (format.isArray && format.type !== "image" && format.type !== "lookup") {
-    // 配列型の場合、空配列も許容
-    zodType = z.union([
-      z.array(z.never()), // 空配列
-      z.array(zodType)
-    ]);
+  // Handle arrays - image, lookup, select はすでに処理済み
+  if (format.isArray 
+    && format.type !== "image" 
+    && format.type !== "lookup" 
+    && format.type !== "select"
+  ) {
+    // その他の型で isArray: true の場合（空配列も自動的に許可される）
+    zodType = z.array(zodType);
   }
   
   // Add JSDoc description with column name for better hover experience

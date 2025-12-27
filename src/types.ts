@@ -161,6 +161,11 @@ export interface CodaColumnFormat {
   isArray?: boolean;
   format?: string;
   display?: string;
+  options?: Array<{
+    name: string;
+    foregroundColor?: string;
+    backgroundColor?: string;
+  }>;
   table?: {
     id: string;
     type: string;

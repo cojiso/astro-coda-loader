@@ -427,13 +427,14 @@ async function expandLookups(
  * 特定の型のカラムの値をオブジェクトに正規化
  */
 function normalizeEmptyToObject(
-  values: Record<string, RawValue>, 
+  values: Record<string, RawValue>,
   columnTypes: Record<string, string>
 ): Record<string, RawValue> {
   const result: Record<string, RawValue> = { ...values };
-  
+
   for (const [key, value] of Object.entries(values)) {
     const columnType = columnTypes[key];
+    const column = columnsCache[key];
     
     // リンク型のカラムをWebPageオブジェクトに変換（空でなくても変換）
     if (columnType === "link") {
@@ -550,16 +551,16 @@ function normalizeEmptyToObject(
       // 既に配列の場合はそのまま
       if (Array.isArray(value)) {
         // 処理なし
-      } 
+      }
       // 空/null/undefinedの場合は空配列
       else if (value === null || value === undefined || value === "") {
         result[key] = [];
       }
       // 単一のRowReferenceの場合は配列に変換
       else if (
-        value && 
-        typeof value === 'object' && 
-        '@type' in value && 
+        value &&
+        typeof value === 'object' &&
+        '@type' in value &&
         value['@type'] === 'StructuredValue' &&
         'additionalType' in value &&
         value['additionalType'] === 'row'
@@ -571,8 +572,24 @@ function normalizeEmptyToObject(
         result[key] = [];
       }
     }
+
+    // select型でisArray=trueのカラムを常に配列に正規化
+    else if (columnType === "select" && column?.format.isArray) {
+      // 既に配列の場合はそのまま
+      if (Array.isArray(value)) {
+        // 処理なし
+      }
+      // 空文字列/null/undefinedの場合は空配列
+      else if (value === null || value === undefined || value === "") {
+        result[key] = [];
+      }
+      // その他の場合も空配列（念のため）
+      else {
+        result[key] = [];
+      }
+    }
   }
-  
+
   return result;
 }
 
