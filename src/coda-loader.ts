@@ -25,9 +25,15 @@ interface LookupCache {
   [key: string]: CodaRow | null; // tableId:rowId -> 行データ
 }
 
+// テーブルデータとカラム情報のセット
+interface TableDataWithColumns {
+  rows: Map<string, CodaRow>;
+  columnTypes: Record<string, string>; // columnId -> type
+}
+
 // テーブル全体のキャッシュ（テーブル単位）
 interface TableCache {
-  [tableId: string]: Map<string, CodaRow>; // tableId -> (rowId -> 行データ)
+  [tableId: string]: TableDataWithColumns; // tableId -> テーブルデータ
 }
 
 /**
@@ -60,10 +66,12 @@ async function expandSingleReference(
   }
 
   let referencedRow: CodaRow | null = null;
+  let tableColumnTypes: Record<string, string> = {};
 
   // 1. まずテーブルキャッシュから取得を試みる
   if (context.tableCache[reference.tableId]) {
-    referencedRow = context.tableCache[reference.tableId].get(reference.rowId) || null;
+    referencedRow = context.tableCache[reference.tableId].rows.get(reference.rowId) || null;
+    tableColumnTypes = context.tableCache[reference.tableId].columnTypes;
     if (referencedRow) {
       logger.debug(`Found row ${refKey} in table cache`);
     }
@@ -89,7 +97,8 @@ async function expandSingleReference(
       }
 
       // テーブルキャッシュから該当行を取得
-      referencedRow = context.tableCache[reference.tableId].get(reference.rowId) || null;
+      referencedRow = context.tableCache[reference.tableId].rows.get(reference.rowId) || null;
+      tableColumnTypes = context.tableCache[reference.tableId].columnTypes;
 
       // 行キャッシュにも保存（後方互換性のため）
       context.cache[refKey] = referencedRow;
@@ -110,9 +119,19 @@ async function expandSingleReference(
   // 参照先を処理済みとしてマーク
   context.processedRefs.add(refKey);
 
+  // 参照先の行データを正規化（カラム型情報がある場合のみ）
+  let normalizedRow = referencedRow;
+  if (Object.keys(tableColumnTypes).length > 0) {
+    const normalizedValues = normalizeEmptyToObject(referencedRow.values, tableColumnTypes);
+    normalizedRow = {
+      ...referencedRow,
+      values: normalizedValues
+    };
+  }
+
   // 参照先の行に対してルックアップを再帰的に展開
   const deeperExpandedRow = await expandRowLookups(
-    referencedRow,
+    normalizedRow,
     docId,
     token,
     context,
@@ -270,7 +289,16 @@ async function fetchTableData(
   tableId: string,
   token: string,
   logger: any
-): Promise<Map<string, CodaRow>> {
+): Promise<TableDataWithColumns> {
+  // カラム情報を取得
+  const columnsData = await fetchColumnData(docId, tableId, token);
+  const columnTypes: Record<string, string> = {};
+
+  for (const column of columnsData.items) {
+    columnTypes[column.id] = column.format.type;
+  }
+
+  // 行データを取得
   const baseUrl = `https://coda.io/apis/v1/docs/${docId}/tables/${encodeURIComponent(tableId)}/rows`;
   const queryParams = new URLSearchParams();
   queryParams.append("valueFormat", "rich");
@@ -329,7 +357,11 @@ async function fetchTableData(
   } while (pageToken);
 
   logger.info(`Loaded table ${tableId}: ${rowsMap.size} rows`);
-  return rowsMap;
+
+  return {
+    rows: rowsMap,
+    columnTypes
+  };
 }
 
 /**
@@ -393,7 +425,7 @@ async function expandLookups(
       // テーブルキャッシュの統計情報
       const cachedTableCount = Object.keys(context.tableCache).length;
       const cachedRowCount = Object.values(context.tableCache).reduce(
-        (sum, table) => sum + table.size,
+        (sum, table) => sum + table.rows.size,
         0
       );
 
@@ -410,7 +442,7 @@ async function expandLookups(
   const totalTime = Math.round((Date.now() - startTime) / 1000);
   const cachedTableCount = Object.keys(context.tableCache).length;
   const cachedRowCount = Object.values(context.tableCache).reduce(
-    (sum, table) => sum + table.size,
+    (sum, table) => sum + table.rows.size,
     0
   );
 
