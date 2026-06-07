@@ -770,6 +770,10 @@ export function codaLoader({
         }
 
         // Step 3: Process rows and add to store
+        // 取得成功後にストアをクリアして stale な行（Coda 側で削除・非公開化された行）を除去する。
+        // fetch 失敗時はここに到達しないため、API エラーで全件消える事故を防げる。
+        store.clear();
+
         let totalRowsProcessed = 0;
         for (const row of processedRows) {
           const id = row.id;
