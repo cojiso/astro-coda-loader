@@ -18,7 +18,6 @@
     "build": "tsc",
     "prepare": "pnpm run build",
     "prepublishOnly": "pnpm run build"
-    
   },
   "keywords": [
     "astro-loader",
@@ -27,16 +26,16 @@
     "coda.io",
     "content"
   ],
-  "author": "",
+  "author": "cojiso",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yourusername/astro-coda-loader.git"
+    "url": "git+https://github.com/cojiso/astro-coda-loader.git"
   },
   "bugs": {
-    "url": "https://github.com/yourusername/astro-coda-loader/issues"
+    "url": "https://github.com/cojiso/astro-coda-loader/issues"
   },
-  "homepage": "https://github.com/yourusername/astro-coda-loader#readme",
+  "homepage": "https://github.com/cojiso/astro-coda-loader#readme",
   "peerDependencies": {
     "astro": "^5.0.0 || ^4.14.0"
   },
