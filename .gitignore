@@ -5,13 +5,15 @@ yarn-debug.log
 yarn-error.log
 
 # Build output
-dist/
 *.js
 *.js.map
 !jest.config.js
 
 # Exceptions
 !src/**/*.js
+# dist はパッケージ配布物としてコミットする（git 依存で install 時ビルドを不要にするため）
+!dist/
+!dist/**
 
 # IDE
 .idea/

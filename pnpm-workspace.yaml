@@ -1,4 +1,0 @@
-# esbuild/sharp は astro(devDep) の transitive 依存。ビルドは tsc のみで native ビルド不要なので明示的にスキップする。
-allowBuilds:
-  esbuild: false
-  sharp: false

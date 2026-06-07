@@ -1,0 +1,640 @@
+import { AstroError } from "astro/errors";
+import { z } from "astro/zod";
+import { codaFormatToZodType, createBaseRowSchema } from "./schema-utils";
+import { cleanValues, isRawRowReference } from "./normalize-utils";
+/**
+ * カラム情報のキャッシュ
+ */
+let columnsCache = {};
+/**
+ * 単一の参照の展開を行う（テーブルキャッシュ対応版）
+ */
+async function expandSingleReference(reference, docId, token, context, currentDepth, maxDepth, logger) {
+    const refKey = `${reference.tableId}:${reference.rowId}`;
+    // 循環参照チェック
+    if (context.processedRefs.has(refKey)) {
+        return null; // 循環参照は拡張せず、nullを返す
+    }
+    let referencedRow = null;
+    let tableColumnTypes = {};
+    // 1. まずテーブルキャッシュから取得を試みる
+    if (context.tableCache[reference.tableId]) {
+        referencedRow = context.tableCache[reference.tableId].rows.get(reference.rowId) || null;
+        tableColumnTypes = context.tableCache[reference.tableId].columnTypes;
+        if (referencedRow) {
+            logger.debug(`Found row ${refKey} in table cache`);
+        }
+    }
+    // 2. テーブルキャッシュになければ、行キャッシュを確認
+    if (!referencedRow && context.cache[refKey] !== undefined) {
+        referencedRow = context.cache[refKey];
+    }
+    // 3. どちらのキャッシュにもない場合、テーブル全体を取得してキャッシュ
+    if (!referencedRow && context.cache[refKey] === undefined) {
+        try {
+            // テーブル全体を取得
+            if (!context.tableCache[reference.tableId]) {
+                context.tableCache[reference.tableId] = await fetchTableData(docId, reference.tableId, token, logger);
+            }
+            // テーブルキャッシュから該当行を取得
+            referencedRow = context.tableCache[reference.tableId].rows.get(reference.rowId) || null;
+            tableColumnTypes = context.tableCache[reference.tableId].columnTypes;
+            // 行キャッシュにも保存（後方互換性のため）
+            context.cache[refKey] = referencedRow;
+        }
+        catch (error) {
+            // 取得に失敗した場合はnullをキャッシュ
+            logger.warn(`Failed to fetch table ${reference.tableId}: ${error instanceof Error ? error.message : String(error)}`);
+            context.cache[refKey] = null;
+            return null;
+        }
+    }
+    // 参照先が見つからなかった場合
+    if (referencedRow === null) {
+        logger.debug(`Row ${refKey} not found`);
+        return null;
+    }
+    // 参照先を処理済みとしてマーク
+    context.processedRefs.add(refKey);
+    // 参照先の行データを正規化（カラム型情報がある場合のみ）
+    let normalizedRow = referencedRow;
+    if (Object.keys(tableColumnTypes).length > 0) {
+        const normalizedValues = normalizeEmptyToObject(referencedRow.values, tableColumnTypes);
+        normalizedRow = {
+            ...referencedRow,
+            values: normalizedValues
+        };
+    }
+    // 参照先の行に対してルックアップを再帰的に展開
+    const deeperExpandedRow = await expandRowLookups(normalizedRow, docId, token, context, currentDepth + 1, maxDepth, logger);
+    // 元の参照に展開データを追加
+    const expandedRef = {
+        ...reference,
+        values: {
+            id: deeperExpandedRow.id,
+            values: deeperExpandedRow.values
+        }
+    };
+    // Debug logging
+    logger.debug(`Expanded ref: ${reference.rowId} at depth ${currentDepth}`);
+    return expandedRef;
+}
+/**
+ * 特定のCoda行からルックアップ参照を展開する
+ */
+async function expandRowLookups(row, docId, token, context, currentDepth = 0, maxDepth = 1, logger) {
+    // 展開しない条件
+    if (maxDepth <= 0 || currentDepth >= maxDepth) {
+        return row;
+    }
+    // 結果用に値をコピー
+    const expandedValues = { ...row.values };
+    // 各値をチェックして展開
+    for (const [key, value] of Object.entries(row.values)) {
+        // 単一のルックアップ参照の場合 - 先に処理
+        if (isRawRowReference(value)) {
+            // 参照を展開
+            const expandedRef = await expandSingleReference(value, docId, token, context, currentDepth, maxDepth, logger);
+            // 展開できた場合のみ値を更新
+            if (expandedRef) {
+                expandedValues[key] = expandedRef;
+            }
+        }
+        // 配列の場合（複数のルックアップ参照）
+        else if (Array.isArray(value)) {
+            const expandedItems = [];
+            let hasExpanded = false;
+            for (const item of value) {
+                // RowReference でなければそのまま追加して次へ
+                if (!isRawRowReference(item)) {
+                    expandedItems.push(item);
+                    continue;
+                }
+                // 参照を展開
+                const expandedRef = await expandSingleReference(item, docId, token, context, currentDepth, maxDepth, logger);
+                // 展開できなかった場合は元の参照を保持
+                if (!expandedRef) {
+                    expandedItems.push(item);
+                    continue;
+                }
+                // 展開できた場合
+                expandedItems.push(expandedRef);
+                hasExpanded = true;
+            }
+            // 少なくとも1つ展開されていたら、更新された配列を設定
+            if (hasExpanded) {
+                expandedValues[key] = expandedItems;
+            }
+        }
+    }
+    return {
+        ...row,
+        values: expandedValues
+    };
+}
+/**
+ * 特定の行データを取得する（旧方式：後方互換性のために残す）
+ */
+async function fetchRowData(docId, tableId, rowId, token) {
+    const url = `https://coda.io/apis/v1/docs/${docId}/tables/${encodeURIComponent(tableId)}/rows/${rowId}?valueFormat=rich`;
+    // タイムアウト用のコントローラーを作成
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15秒タイムアウト
+    try {
+        const response = await fetch(url, {
+            headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+            },
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch row: ${response.status} ${response.statusText}`);
+        }
+        return await response.json();
+    }
+    catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            throw new Error(`Request timed out`);
+        }
+        throw error;
+    }
+}
+/**
+ * テーブル全体のデータを取得する（新方式：一括取得）
+ */
+async function fetchTableData(docId, tableId, token, logger) {
+    // カラム情報を取得
+    const columnsData = await fetchColumnData(docId, tableId, token);
+    const columnTypes = {};
+    for (const column of columnsData.items) {
+        columnTypes[column.id] = column.format.type;
+    }
+    // 行データを取得
+    const baseUrl = `https://coda.io/apis/v1/docs/${docId}/tables/${encodeURIComponent(tableId)}/rows`;
+    const queryParams = new URLSearchParams();
+    queryParams.append("valueFormat", "rich");
+    queryParams.append("limit", "500"); // 1リクエストあたりの最大取得数
+    const rowsMap = new Map();
+    let pageToken = undefined;
+    let pageCount = 0;
+    do {
+        if (pageToken) {
+            queryParams.set("pageToken", pageToken);
+        }
+        const url = `${baseUrl}?${queryParams.toString()}`;
+        // タイムアウト用のコントローラーを作成
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30秒タイムアウト
+        try {
+            pageCount++;
+            logger.debug(`Fetching table ${tableId} page ${pageCount}...`);
+            const response = await fetch(url, {
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    "Content-Type": "application/json",
+                },
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch table data: ${response.status} ${response.statusText}`);
+            }
+            const data = await response.json();
+            // 行データをMapに格納
+            for (const row of data.items) {
+                rowsMap.set(row.id, row);
+            }
+            pageToken = data.nextPageToken;
+            logger.debug(`Fetched ${data.items.length} rows from table ${tableId} (total: ${rowsMap.size})`);
+        }
+        catch (error) {
+            clearTimeout(timeoutId);
+            if (error instanceof Error && error.name === 'AbortError') {
+                throw new Error(`Request timed out while fetching table ${tableId}`);
+            }
+            throw error;
+        }
+    } while (pageToken);
+    logger.info(`Loaded table ${tableId} - ${rowsMap.size} rows`);
+    return {
+        rows: rowsMap,
+        columnTypes
+    };
+}
+/**
+ * 複数の行に対してルックアップを展開する（テーブルキャッシュ対応版）
+ */
+async function expandLookups(rows, docId, token, maxDepth, logger) {
+    if (maxDepth <= 0) {
+        return rows; // 展開しない
+    }
+    logger.info(`Expanding lookups to depth ${maxDepth} for ${rows.length} rows...`);
+    const context = {
+        processedRefs: new Set(),
+        cache: {},
+        tableCache: {} // テーブルキャッシュを初期化
+    };
+    const expandedRows = [];
+    const startTime = Date.now();
+    for (const row of rows) {
+        // 各行に対する処理済み参照をリセット（行をまたぐ循環参照は許可）
+        context.processedRefs.clear();
+        try {
+            // ルックアップを展開
+            const expandedRow = await expandRowLookups(row, docId, token, context, 0, maxDepth, logger);
+            // if (logger) {
+            //   logger.info(`Expanded row ${row.id} structure: ${JSON.stringify(expandedRow, null, 2)}`);
+            // }
+            expandedRows.push(expandedRow);
+        }
+        catch (error) {
+            // エラーの場合は元の行を追加して処理を続行
+            logger.warn(`Error expanding row ${row.id}: ${error instanceof Error ? error.message : String(error)}`);
+            expandedRows.push(row);
+        }
+    }
+    const totalTime = Math.round((Date.now() - startTime) / 1000);
+    const cachedTableCount = Object.keys(context.tableCache).length;
+    logger.info(`Lookup expansion completed in ${totalTime}s - ` +
+        `Cached ${cachedTableCount} tables`);
+    // Debug: サンプル行構造を出力
+    if (expandedRows.length > 0) {
+        logger.debug(`Sample expanded row structure: ${JSON.stringify(expandedRows[0], null, 2)}`);
+    }
+    return expandedRows;
+}
+/**
+ * 特定の型のカラムの値をオブジェクトに正規化
+ */
+function normalizeEmptyToObject(values, columnTypes) {
+    const result = { ...values };
+    for (const [key, value] of Object.entries(values)) {
+        const columnType = columnTypes[key];
+        const column = columnsCache[key];
+        // リンク型のカラムをWebPageオブジェクトに変換（空でなくても変換）
+        if (columnType === "link") {
+            // 空の場合は空のWebPageオブジェクト
+            if (value === null || value === undefined || value === "") {
+                result[key] = {
+                    "@context": "http://schema.org/",
+                    "@type": "WebPage",
+                    "url": ""
+                };
+            }
+            // 文字列の場合はURLとしてWebPageオブジェクトに変換
+            else if (typeof value === "string") {
+                result[key] = {
+                    "@context": "http://schema.org/",
+                    "@type": "WebPage",
+                    "url": value
+                };
+            }
+            // 既にWebPageオブジェクトの場合はそのまま
+        }
+        // 数値タイプのカラムを常に number に正規化
+        else if (columnType === "number" || columnType === "slider" || columnType === "currency") {
+            // 既に数値の場合はそのまま
+            if (typeof value === 'number') {
+                // 処理なし
+            }
+            // 文字列の場合は数値に変換
+            else if (typeof value === 'string') {
+                const num = Number(value);
+                result[key] = isNaN(num) ? 0 : num; // NaN の場合は 0 に
+            }
+            // null/undefined の場合は 0 に
+            else if (value === null || value === undefined) {
+                result[key] = 0;
+            }
+            // その他の場合も 0（念のため）
+            else {
+                result[key] = 0;
+            }
+        }
+        // 真偽値タイプのカラムを正規化
+        else if (columnType === "boolean" || columnType === "checkbox") {
+            // 既に真偽値の場合はそのまま
+            if (typeof value === 'boolean') {
+                // 処理なし
+            }
+            // 文字列の場合は真偽値に変換
+            else if (typeof value === 'string') {
+                if (value.toLowerCase() === 'true') {
+                    result[key] = true;
+                }
+                else if (value.toLowerCase() === 'false') {
+                    result[key] = false;
+                }
+                else {
+                    // 'true'/'false'以外の文字列は null に
+                    result[key] = null;
+                }
+            }
+            // null/undefined はそのまま保持
+            else if (value === null || value === undefined) {
+                result[key] = null;
+            }
+            // その他の値は null に
+            else {
+                result[key] = null;
+            }
+        }
+        // 人物型のカラムをPersonオブジェクトに変換（空でなくても変換）
+        else if (columnType === "person") {
+            // 空の場合は空のPersonオブジェクト
+            if (value === null || value === undefined || value === "") {
+                result[key] = {
+                    "@context": "http://schema.org/",
+                    "@type": "Person",
+                    "name": ""
+                };
+            }
+            // 文字列の場合は名前としてPersonオブジェクトに変換
+            else if (typeof value === "string") {
+                result[key] = {
+                    "@context": "http://schema.org/",
+                    "@type": "Person",
+                    "name": value
+                };
+            }
+            // 既にPersonオブジェクトの場合はそのまま
+        }
+        // image型のカラムを常に配列に正規化
+        else if (columnType === "image") {
+            // 既に配列の場合はそのまま
+            if (Array.isArray(value)) {
+                // 処理なし
+            }
+            // 空文字の場合は空配列
+            else if (value === null || value === undefined || value === "") {
+                result[key] = [];
+            }
+            // 単一のImageObjectの場合は配列に変換
+            else if (value && typeof value === 'object' && '@type' in value && value['@type'] === 'ImageObject') {
+                result[key] = [value];
+            }
+            // その他の場合も空配列（念のため）
+            else {
+                result[key] = [];
+            }
+        }
+        // lookup型のカラムを常に配列に正規化
+        else if (columnType === "lookup") {
+            // 既に配列の場合はそのまま
+            if (Array.isArray(value)) {
+                // 処理なし
+            }
+            // 空/null/undefinedの場合は空配列
+            else if (value === null || value === undefined || value === "") {
+                result[key] = [];
+            }
+            // 単一のRowReferenceの場合は配列に変換
+            else if (value &&
+                typeof value === 'object' &&
+                '@type' in value &&
+                value['@type'] === 'StructuredValue' &&
+                'additionalType' in value &&
+                value['additionalType'] === 'row') {
+                result[key] = [value];
+            }
+            // その他の場合も空配列（念のため）
+            else {
+                result[key] = [];
+            }
+        }
+        // select型でisArray=trueのカラムを常に配列に正規化
+        else if (columnType === "select" && column?.format.isArray) {
+            // 既に配列の場合はそのまま
+            if (Array.isArray(value)) {
+                // 処理なし
+            }
+            // 空文字列/null/undefinedの場合は空配列
+            else if (value === null || value === undefined || value === "") {
+                result[key] = [];
+            }
+            // その他の場合も空配列（念のため）
+            else {
+                result[key] = [];
+            }
+        }
+    }
+    return result;
+}
+/**
+ * Codaのカラム情報を取得
+ */
+async function fetchColumnData(docId, tableIdOrName, token) {
+    const url = `https://coda.io/apis/v1/docs/${docId}/tables/${encodeURIComponent(tableIdOrName)}/columns`;
+    const response = await fetch(url, {
+        headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+        },
+    });
+    if (!response.ok) {
+        throw new AstroError(`Failed to fetch table columns from Coda: ${response.status} ${response.statusText}`);
+    }
+    return await response.json();
+}
+/**
+ * Loads data from a Coda.io table.
+ */
+export function codaLoader({ token = import.meta.env.CODA_API_TOKEN || import.meta.env.PUBLIC_CODA_API_TOKEN, docId = import.meta.env.CODA_DOC_ID || import.meta.env.PUBLIC_CODA_DOC_ID, tableIdOrName = import.meta.env.CODA_TABLE_ID || import.meta.env.PUBLIC_CODA_TABLE_ID, query, sortBy, limit, cleanStrings = true, maxLookupDepth = 0 // デフォルトでは展開しない
+ }) {
+    if (!token) {
+        throw new AstroError("Missing Coda API token. Set it in the CODA_API_TOKEN or PUBLIC_CODA_API_TOKEN environment variable or pass it as an option.");
+    }
+    if (!docId) {
+        throw new AstroError("Missing Coda doc ID. Set it in the CODA_DOC_ID or PUBLIC_CODA_DOC_ID environment variable or pass it as an option.");
+    }
+    if (!tableIdOrName) {
+        throw new AstroError("Missing Coda table ID or name. Set it in the CODA_TABLE_ID or PUBLIC_CODA_TABLE_ID environment variable or pass it as an option.");
+    }
+    // カラム型情報のキャッシュ
+    let columnTypesCache = {};
+    let columnsDataCache = null;
+    return {
+        name: "coda-loader",
+        load: async ({ logger, parseData, store }) => {
+            logger.info(`Loading data from Coda table "${tableIdOrName}"`);
+            // カラム情報を取得（まだ取得していない場合）
+            if (Object.keys(columnTypesCache).length === 0) {
+                try {
+                    const columnsData = await fetchColumnData(docId, tableIdOrName, token);
+                    columnsDataCache = columnsData;
+                    // カラム型情報をキャッシュ
+                    for (const column of columnsData.items) {
+                        columnTypesCache[column.id] = column.format.type;
+                        columnsCache[column.id] = column;
+                    }
+                }
+                catch (error) {
+                    logger.warn(`Could not fetch column data: ${error instanceof Error ? error.message : String(error)}`);
+                }
+            }
+            // Construct the API URL
+            const baseUrl = `https://coda.io/apis/v1/docs/${docId}/tables/${encodeURIComponent(tableIdOrName)}/rows`;
+            // Helper function to fetch rows for a single query (without lookup expansion)
+            const fetchRowsForQuery = async (queryString) => {
+                // Add query parameters
+                const queryParams = new URLSearchParams();
+                // Always add valueFormat=rich to get enhanced data including images
+                queryParams.append("valueFormat", "rich");
+                if (queryString)
+                    queryParams.append("query", queryString);
+                if (sortBy)
+                    queryParams.append("sortBy", sortBy);
+                if (limit)
+                    queryParams.append("limit", limit.toString());
+                const url = `${baseUrl}?${queryParams.toString()}`;
+                // Fetch data from Coda.io API
+                const response = await fetch(url, {
+                    headers: {
+                        Authorization: `Bearer ${token}`,
+                        "Content-Type": "application/json",
+                    },
+                });
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new AstroError(`Failed to fetch data from Coda: ${response.status} ${response.statusText}. ${JSON.stringify(errorData)}`);
+                }
+                const data = await response.json();
+                return data.items;
+            };
+            try {
+                // Convert query to array of query strings
+                let queries;
+                if (!query) {
+                    // No query specified
+                    queries = [undefined];
+                }
+                else if (typeof query === 'string') {
+                    // Single string query
+                    queries = [query];
+                }
+                else {
+                    // QueryFilter object - convert to multiple query strings
+                    const { column, values } = query;
+                    // Handle column names with spaces (need quotes)
+                    const columnPart = column.includes(' ') ? `"${column}"` : column;
+                    queries = values.map(value => {
+                        // JSON.stringify handles strings, numbers, booleans correctly
+                        return `${columnPart}:${JSON.stringify(value)}`;
+                    });
+                }
+                // Step 1: Fetch rows for all queries
+                let allRows = [];
+                for (const q of queries) {
+                    const rows = await fetchRowsForQuery(q);
+                    allRows.push(...rows);
+                }
+                // Remove duplicates by ID (in case queries overlap)
+                const uniqueRowsMap = new Map();
+                for (const row of allRows) {
+                    uniqueRowsMap.set(row.id, row);
+                }
+                const uniqueRows = Array.from(uniqueRowsMap.values());
+                // Build log message with query details
+                let logMessage = `Fetched ${uniqueRows.length} unique rows from ${queries.length} ${queries.length === 1 ? 'query' : 'queries'}`;
+                // Show values from the original query object
+                if (query && typeof query === 'object' && 'column' in query) {
+                    const valuesStr = query.values.map(v => JSON.stringify(v)).join(', ');
+                    logMessage += ` [${valuesStr}]`;
+                }
+                logger.info(logMessage);
+                // Step 2: Expand lookups once for all rows (if maxLookupDepth > 0)
+                let processedRows;
+                if (maxLookupDepth > 0) {
+                    try {
+                        processedRows = await expandLookups(uniqueRows, docId, token, maxLookupDepth, logger);
+                    }
+                    catch (error) {
+                        logger.warn(`Error during lookup expansion, continuing with unexpanded data`);
+                        processedRows = uniqueRows;
+                    }
+                }
+                else {
+                    processedRows = uniqueRows;
+                }
+                // Step 3: Process rows and add to store
+                // 取得成功後にストアをクリアして stale な行（Coda 側で削除・非公開化された行）を除去する。
+                // fetch 失敗時はここに到達しないため、API エラーで全件消える事故を防げる。
+                store.clear();
+                let totalRowsProcessed = 0;
+                for (const row of processedRows) {
+                    const id = row.id;
+                    // 空の値を対応するオブジェクトに変換
+                    const normalizedValues = normalizeEmptyToObject(row.values, columnTypesCache);
+                    // 文字列のクリーニング（バッククォート除去など）
+                    const cleanedValues = cleanStrings ? cleanValues(normalizedValues) : normalizedValues;
+                    // 処理済みの行データを作成
+                    let rowData = {
+                        ...row,
+                        values: cleanedValues
+                    };
+                    // Convert to Record<string, unknown> for parseData compatibility
+                    const dataForParsing = {
+                        id: rowData.id,
+                        type: rowData.type,
+                        name: rowData.name,
+                        index: rowData.index,
+                        createdAt: rowData.createdAt,
+                        updatedAt: rowData.updatedAt,
+                        browserLink: rowData.browserLink,
+                        href: rowData.href,
+                        values: rowData.values
+                    };
+                    const parsedData = await parseData({ id, data: dataForParsing });
+                    store.set({ id, data: parsedData });
+                    totalRowsProcessed++;
+                }
+                logger.info(`Loaded ${totalRowsProcessed} records from "${tableIdOrName}"`);
+            }
+            catch (error) {
+                if (error instanceof AstroError) {
+                    throw error;
+                }
+                throw new AstroError(`Error loading data from Coda: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        },
+        // Auto-generate schema from the Coda table structure
+        schema: async () => {
+            try {
+                // カラム情報をまだ取得していない場合は取得
+                if (!columnsDataCache) {
+                    columnsDataCache = await fetchColumnData(docId, tableIdOrName, token);
+                    // カラム型情報をキャッシュ
+                    for (const column of columnsDataCache.items) {
+                        columnTypesCache[column.id] = column.format.type;
+                        columnsCache[column.id] = column;
+                    }
+                }
+                // Build the values schema based on column types
+                const valuesSchema = {};
+                for (const column of columnsDataCache.items) {
+                    const columnId = column.id;
+                    const columnName = column.name;
+                    // Add to values schema with column name information
+                    valuesSchema[columnId] = codaFormatToZodType(column.format, columnName, column.formula);
+                }
+                // Build the base schema for row metadata and add the values schema
+                const baseSchema = createBaseRowSchema();
+                // Use passthrough to allow additional properties that might not be in the schema
+                const schema = baseSchema.extend({
+                    values: z.object(valuesSchema).passthrough()
+                });
+                return schema;
+            }
+            catch (error) {
+                // If schema auto-generation fails, return a generic schema
+                console.warn(`Could not auto-generate schema: ${error instanceof Error ? error.message : String(error)}`);
+                const baseSchema = createBaseRowSchema();
+                return baseSchema.extend({
+                    values: z.record(z.any())
+                });
+            }
+        },
+    };
+}
